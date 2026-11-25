@@ -175,11 +175,55 @@ function Install-Workspace {
     }
     $target = if ($env:MONA_WEW) { $env:MONA_WEW } else { "C:\$($wew.Name)" }
     Write-Step "installing WinDBG workspace to $target"
-    New-Item -ItemType Directory -Path (Split-Path $target -Parent) -Force | Out-Null
+    # Split-Path on 'C:\foo.WEW' gives 'C:\', and New-Item -ItemType Directory
+    # rejects a drive root - so only create the parent when it is missing
+    $parent = Split-Path $target -Parent
+    if ($parent -and -not (Test-Path $parent)) {
+        New-Item -ItemType Directory -Path $parent -Force | Out-Null
+    }
     # WinDBG writes the workspace back on exit, so never clobber an existing one
     Backup-File $target
     Copy-Item $wew.FullName $target -Force
     return $target
+}
+
+function Set-MonaConfig {
+    # Writes mona.ini the way mona itself does (key=value, # comments). mona.ini
+    # lives in the folder that holds mona.py, so seeding it here means the
+    # setting sticks regardless of how mona is launched - which matters because
+    # "!mona config -set ..." cannot run on the same command line that defines
+    # the !mona alias (WinDBG parses the whole line before the alias exists).
+    param([string]$Ini, [hashtable]$Settings)
+
+    $lines = @()
+    if (Test-Path $Ini) {
+        $lines = @(Get-Content $Ini)
+    } else {
+        $lines = @(
+            '# -----------------------------------------------#',
+            '# mona.py configuration file                      #',
+            '# Corelan Consulting bv - https://www.corelan.be  #',
+            '# -----------------------------------------------#'
+        )
+    }
+
+    foreach ($key in @($Settings.Keys)) {
+        $value = $Settings[$key]
+        $found = $false
+        for ($i = 0; $i -lt $lines.Count; $i++) {
+            $line = $lines[$i]
+            if (-not $line -or $line.TrimStart().StartsWith('#')) { continue }
+            if (($line.Split('=', 2)[0]).Trim() -ieq $key) {
+                $lines[$i] = "$key=$value"
+                $found = $true
+            }
+        }
+        if (-not $found) { $lines += "$key=$value" }
+        Write-Note "    $key=$value"
+    }
+
+    Set-Content -Path $Ini -Value $lines -Encoding ASCII
+    Write-Note "    written to $Ini"
 }
 
 function New-WinDbgShortcut {
@@ -213,8 +257,9 @@ function Write-Launchers {
         if (-not (Test-Path $archDir)) { continue }
         $tag = if ($t.Selector -like '-2*') { 'py2' } else { 'py3' }
 
+        # Deliberately just load + alias. The working folder comes from mona.ini,
+        # because a "!mona ..." call here would not be alias-substituted yet.
         $cmd = "!load pykd; as !mona !py $($t.Selector) $Mona\mona.py"
-        if ($WorkFolder) { $cmd = "$cmd; !mona config -set workingfolder $WorkFolder\%p" }
         $wf = ''
         if ($Wew) { $wf = "-WF `"$Wew`" " }
 
@@ -259,14 +304,13 @@ function Show-Summary {
     Write-Host ''
     Write-Step 'done'
     Write-Host ''
-    if ($Wew) {
-        Write-Host 'Workspace and working folders:' -ForegroundColor Cyan
-        Write-Host "    workspace      $Wew"
-        Write-Host "    mona output    $WorkFolder\<process name>"
-        Write-Host ''
-        Write-Host 'Pin the launcher: Desktop > "WinDBG x86 mona3 (py3)" > right-click > Pin to taskbar' -ForegroundColor Cyan
-        Write-Host ''
-    }
+    Write-Host 'Paths:' -ForegroundColor Cyan
+    Write-Host "    mona.ini       $Mona\mona.ini"
+    Write-Host "    mona output    $WorkFolder\<process name>   (created on first write)"
+    if ($Wew) { Write-Host "    workspace      $Wew" }
+    Write-Host ''
+    Write-Host 'Pin the launcher: Desktop > "WinDBG x86 mona3 (py3)" > right-click > Pin to taskbar' -ForegroundColor Cyan
+    Write-Host ''
     Write-Host 'Run mona in WinDBG classic / WinDBGX:' -ForegroundColor Cyan
     Write-Host '    !load pykd'
     foreach ($t in $Installed) {
@@ -282,6 +326,7 @@ function Show-Summary {
     Write-Host ''
     Write-Host 'If something misbehaves:' -ForegroundColor Cyan
     Write-Host '    !pykd.info                          # which pykd-ext + which pythons it sees'
+    Write-Host '    !mona config -get workingfolder     # should echo the path above'
     Write-Host "    regsvr32 `"${env:ProgramFiles(x86)}\Common Files\Microsoft Shared\VC\msdia140.dll`""
     Write-Host '    open a NEW terminal so the updated PATH is picked up'
     if (-not $Ok) {
@@ -487,6 +532,8 @@ Write-Note "    $($pathEntries -join ';')"
 # -- 8. workspace, mona working folders, launchers ---------------------------
 $workFolder = Join-Path $MonaDir 'workingfolders'
 New-Item -ItemType Directory -Path $workFolder -Force | Out-Null
+Write-Step 'configuring mona working folder'
+Set-MonaConfig -Ini (Join-Path $MonaDir 'mona.ini') -Settings @{ workingfolder = "$workFolder\%p" }
 $wewInstalled = Install-Workspace
 Write-Launchers -Installed $installed -DbgRoot $dbgRoot -Mona $MonaDir -WorkFolder $workFolder -Wew $wewInstalled
 
